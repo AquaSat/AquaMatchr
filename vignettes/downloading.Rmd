@@ -1,5 +1,5 @@
 ---
-title: "Downloading data from EDI"
+title: "Downloading data"
 output: rmarkdown::html_vignette
 vignette: >
   %\VignetteIndexEntry{downloading-edi}
@@ -9,23 +9,24 @@ vignette: >
 
 ```{r, include = FALSE}
 knitr::opts_chunk$set(
-collapse = TRUE,
-comment = "#>"
+  collapse = TRUE,
+  comment = "#>"
 )
 ```
 
-## Downloading and saving parameters
-
-A primary use case for the `{AquaMatchr}` package is to facilitate downloading [AquaMatch](https://aquasat.github.io/AquaMatch_documentation/) data products from the [Environmental Data Initiative ("EDI")](https://edirepository.org/). repository. This vignette walks through how `{AquaMatchr}` functions are used to do this. Note that you are free to do this manually by visiting the EDI website, but the functions in this package are designed to make the process simpler to do entirely within R.
+A primary use case for the `{AquaMatchr}` package is to facilitate downloading of  [AquaMatch](https://aquasat.github.io/AquaMatch_documentation/), [LakeSR and SiteSR](https://aquasat.github.io/AquaMatch_lakeSR/), and [RiverSR](https://zenodo.org/records/4304567) data products. These datasets are hosted in different locations and so the functions provided within `{AquaMatchr}` to retrieve them vary. This vignette walks through how `{AquaMatchr}` functions are used to do this. Note that you are free to do this manually by visiting the data repositories directly, but the functions in this package are designed to make the process simpler to do entirely within R.
 
 We start by loading the package and any other packages we'll want to use for data wrangling, etc.
+
 ```{r setup, message = FALSE, warning = FALSE}
 library(AquaMatchr)
 library(tidyverse)
 library(feather)
 ```
 
-The `AquaMatchr::download_parameters()` function is the method that we've provided to download harmonized *in-situ* sampling data from AquaMatch. It will download the data from EDI and load it into the R environment as a component item of a `list`. (It does **not** save permanent local copies of the datasets automatically.)
+# Downloading and saving *in-situ* parameter data
+
+The `AquaMatchr::download_parameters()` function is the method that we've provided to download harmonized *in-situ* sampling data from AquaMatch. It will download the data from the [Environmental Data Initiative ("EDI")](https://edirepository.org/) repository and load it into the R environment as a component item of a `list`. (It does **not** save permanent local copies of the datasets automatically.)
 
 For example, the following code snippet can be used to download the most recent revision of the total suspended solids (TSS) data product:
 ```{r download-recent-tss}
@@ -72,13 +73,13 @@ gc()
 ```
 
 And finally, if you'd like to save the datasets permanently for use after this R session, you might do it like this (but include a usable file path):
-```{r save-param-data, eval=FALSE}
+```{r save-param-data, eval = FALSE}
 write_feather(x = tss_df, path = "path/to/folder/of/choice")
 ```
 
 Feather files are both time- and space-efficient ways to store data for use in R and other programming languages. (See, for example, [sections 5.4.2 and 5.4.3](https://csgillespie.github.io/efficientR/input-output.html) in Gillespie & Lovelace, 2021). You could also use a `.csv` or `.rds` format here, for example.
 
-### Selecting specific parameter versions
+## Selecting specific parameter versions
 
 There may be instances where you do not want to use the newest version of a published AquaMatch dataset. You can provide an integer number to the `version` argument in place of "newest" to indicate which version, or "revision", you want to retrieve. If you're not sure, you can check how many revisions exist for each dataset on the EDI page for each data release under *Package ID* \> *all revisions*. For example, for TSS that would bring you to [this page](https://portal.edirepository.org/nis/revisionbrowse?scope=edi&identifier=2048). Doing so currently requests that version number for all parameters in your request, so if you don't want, e.g., version 2 of each dataset, you may wish to do your requests separately. For example:
 ```{r demonstrate-versions, error = TRUE}
@@ -98,3 +99,25 @@ sdd_v1 <- download_parameters(
   version = 1
 )
 ```
+
+
+# Downloading LakeSR and SiteSR
+
+Coming soon
+
+# Downloading RiverSR
+
+The RiverSR dataset is stored on Zenodo, and due to its large size we download it without bringing it into the R environment. This takes place through the `AquaMatchr::download_RiverSR()` function, which requires a download path to be provided by the user. The `timeout_length` for `download_RiverSR()` can also be specified but by default is 4,000 seconds, which typically worked in testing for this function (though it may vary throughout time). RiverSR will be downloaded and saved as `"riverSR_usa_v1.1.feather"` in the folder specified in the `save_path` argument.
+
+```{r riversr-download, eval = FALSE}
+download_RiverSR(save_path = "path/to/folder/of/choice")
+
+# Can be loaded into environment using
+RiverSR <- read_feather("path/to/folder/of/choice/riverSR_usa_v1.1.feather")
+```
+
+The RiverSR download will be nearly 14 GB in size and the download may take 30 minutes or more to complete.
+
+
+
+
