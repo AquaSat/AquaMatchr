@@ -4,14 +4,14 @@
 \alias{download_RiverSR}
 \title{Download RiverSR dataset from Zenodo}
 \usage{
-download_RiverSR(save_path, timeout_length = 2000)
+download_RiverSR(save_path, timeout_length = 4000)
 }
 \arguments{
 \item{save_path}{A string containing the path to the folder where the dataset
 should be saved.}
 
 \item{timeout_length}{The number of seconds to allow for the download. Defaults
-to 2000 based on tests of the RiverSR dataset, but can be adjusted as needed.}
+to 4000 based on tests with the RiverSR dataset, but can be adjusted as needed.}
 }
 \value{
 The path to the downloaded file.

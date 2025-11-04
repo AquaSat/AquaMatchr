@@ -150,7 +150,7 @@ download_parameters <- function(parameters, version = "newest"){
 #' @param save_path A string containing the path to the folder where the dataset
 #'  should be saved.
 #' @param timeout_length The number of seconds to allow for the download. Defaults
-#' to 2000 based on tests of the RiverSR dataset, but can be adjusted as needed.
+#' to 4000 based on tests with the RiverSR dataset, but can be adjusted as needed.
 #'
 #' @returns The path to the downloaded file.
 #' @export
@@ -159,7 +159,7 @@ download_parameters <- function(parameters, version = "newest"){
 #' \dontrun{
 #' download_RiverSR(save_path = "~/Downloads/")
 #' }
-download_RiverSR <- function(save_path, timeout_length = 2000){
+download_RiverSR <- function(save_path, timeout_length = 4000){
 
   # Warning to user
   message(
