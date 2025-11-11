@@ -120,12 +120,23 @@ download_parameters <- function(parameters, version = "newest"){
   param_selection <- param_metadata %>%
     dplyr::filter(param %in% parameters)
 
-  # For each param, read and save in list
+  # For each param, read, message citation, and save in list
   split(param_selection, f = param_selection$param) %>%
     purrr::map(.x = .,
                .f = ~{
                  # EDI package ID
                  param_id <- construct_id(identifier = .x$identifier, version = version)
+
+                 # Suggest citation
+                 message(
+                   switch(.x$param,
+                          "chla" = "Chlorophyll",
+                          "doc" = "Dissolved organic carbon",
+                          "sdd" = "Secchi disk depth",
+                          "tss" = "Total suspended solids"),
+                   " recommended citation: ",
+                   EDIutils::read_data_package_citation(packageId = param_id)
+                 )
 
                  # EDI entity ID (specific file to download)
                  entity_id <- EDIutils::read_data_entity_names(packageId = param_id) %>%
@@ -136,7 +147,7 @@ download_parameters <- function(parameters, version = "newest"){
                  raw_bytes <- EDIutils::read_data_entity(packageId = param_id,
                                                          entityId = entity_id)
                  # Parse
-                 readr::read_csv(raw_bytes)
+                 readr::read_csv(raw_bytes, show_col_types = FALSE)
                })
 }
 
@@ -166,15 +177,19 @@ download_RiverSR <- function(save_path, timeout_length = 4000){
     "The size of this file is large (>13GB) so the download will take some time."
   )
 
-  download_zenodo(path = save_path,
-                  doi = "10.5281/zenodo.4304567",
-                  files = "riverSR_usa_v1.1.feather",
-                  timeout = timeout_length)
+  zen4R::download_zenodo(path = save_path,
+                         doi = "10.5281/zenodo.4304567",
+                         files = "riverSR_usa_v1.1.feather",
+                         timeout = timeout_length)
 
   # Confirm file saved and report back
   out_file <- file.path(save_path, "riverSR_usa_v1.1.feather")
 
   if(file.exists(out_file)){
+    message(
+      "RiverSR recommended citation: John Gardner, Xiao Yang, Simon Topp, Matthew Ross, Tamlin Pavelsky, & Elizabeth Altenau. (2020). River Surface Reflectance Database (RiverSR) (v1.1.0) [Data set]. Zenodo. https://doi.org/10.5281/zenodo.4304567. ",
+      "Accessed ", Sys.Date(), "."
+    )
     return(out_file)
   } else {
     stop("Output file cannot be found.")
