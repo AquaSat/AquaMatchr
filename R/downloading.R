@@ -106,6 +106,18 @@ download_parameters <- function(parameters, version = "newest"){
 #' Downloaded files are the surface reflectance database (`riverSR_usa_v1.1.feather`) and shapefile of river centerlines (`nhdplusv2_modified_v1.0.shp`).
 #' It is mostly a wrapper around `zen4R::download_zenodo()`.
 #'
+#' @details
+#' When a file is downloaded, a small metadata file (a "sidecar") is created
+#' next to it, named `<file>.zenodo.rds`. It records the checksum reported by
+#' Zenodo and a separate checksum of the locally saved file. The "if_changed"
+#' option re-downloads riverSR files if the corresponding sidecar is missing,
+#' the checksum reported by Zenodo differs, or the local copy has been
+#' modified. Because the Zenodo record is versioned, its contents do not
+#' change over time; "if_changed" mainly detects modified or corrupted local
+#' copies. Note that in "if_changed" mode, local file checksums are recomputed
+#' on every call, which can take a minute or more for the multi-gigabyte
+#' riverSR files.
+#'
 #' @note
 #' The downloaded files will be large (>13 GB in size), so users will need to
 #' make sure that they have appropriate available storage. During testing,
@@ -115,28 +127,38 @@ download_parameters <- function(parameters, version = "newest"){
 #'   should be saved.
 #' @param timeout_length The number of seconds to allow for the download. Defaults
 #' to 6000 based on tests with the riverSR dataset, but can be adjusted as needed.
-#' @param force Logical. If FALSE (default), the function skips downloading files that
-#' already exist in `download_folder`. If TRUE, existing files will be overwritten.
+#' @param update Character. How should updates to existing files be handled? Options are:
+#' + "ask": prompt before replacing an existing local file
+#' + "always": download and replace it
+#' + "never": reuse the local file whenever it exists
+#' + "if_changed": reuse a local file if the checksum reported by Zenodo is
+#' unchanged and the local copy has not been modified; otherwise download it
+#'
+#' Note that with "ask", a single prompt covers all riverSR files. Files that
+#' do not exist locally are downloaded in every mode.
 #'
 #' @importFrom cli cli_alert_info cli_alert_success cli_alert_warning cli_abort
-#' @return A character string containing the local file paths to the downloaded RiverSR datasets. Returned invisibly.
+#' @return A named character vector containing the local file paths to the
+#' downloaded RiverSR datasets. Returned invisibly.
 #' @export
 #'
 #' @examples
 #' \dontrun{
 #' download_riverSR(download_folder = "~/Downloads/")
 #' }
-download_riverSR <- function(download_folder, timeout_length = 6000, force = FALSE) {
+download_riverSR <- function(download_folder, timeout_length = 6000,
+                             update = "ask") {
+
+  # Check update argument input
+  update <- check_update_arg(update)
 
   # Ensure destination directory exists before running file checks
   if (!dir.exists(download_folder)) {
     dir.create(download_folder, recursive = TRUE)
   }
 
-  # Warning to user
-  cli::cli_alert_info(
-    "The size of these files is large (>13GB) so the download will take some time."
-  )
+  # riverSR Zenodo DOI
+  riverSR_doi <- "10.5281/zenodo.4304567"
 
   # Define the specific files to download, including all shapefile sidecars
   target_files <- c(
@@ -151,73 +173,137 @@ download_riverSR <- function(download_folder, timeout_length = 6000, force = FAL
   out_files <- file.path(download_folder, target_files)
   names(out_files) <- target_files
 
-  # If force == TRUE, ignore whether there are any existing files of the same name
-  if (isTRUE(force)) {
-    cli::cli_alert_info("Force override enabled. Downloading files...")
-    pre_existing_files <- character(0)
+  file_is_present <- file.exists(out_files)
+
+  if (update == "ask" && any(file_is_present)) {
+    user_decision <- ask_user(algal_mask = FALSE,
+                              which_sr = "generic",
+                              file_message = "riverSR")
+
+    # Act on input
+    if (user_decision == "yes") {
+      cli::cli_alert_info("Proceeding with download.")
+      # Treat as an always download
+      update <- "always"
+    } else {
+      cli::cli_abort("Cancelled by user.")
+    }
+  }
+
+  zenodo_checksums <- NULL
+
+  # Determine which files need to be (re)downloaded
+  if (update == "always") {
+    files_to_download <- target_files
+  } else if (update == "never") {
+    files_to_download <- target_files[!file_is_present]
   } else {
-    # Otherwise, take a snapshot of any pre-existing files
-    pre_existing_files <- out_files[file.exists(out_files)]
+    # For "if_changed", reuse an existing file only when its sidecar confirms
+    # that the Zenodo version and the local copy are both unchanged
+    zenodo_checksums <- pull_zenodo_files(doi = riverSR_doi)
 
-    # Early exit if everything is already there
-    if (length(pre_existing_files) == length(target_files)) {
-      cli::cli_alert_success("All files already exist. Use `force = TRUE` to overwrite. Skipping download.")
-      return(invisible(out_files))
-    }
+    files_to_download <- target_files[vapply(
+      X = target_files,
+      FUN = function(file_name) {
+        out_path <- unname(out_files[file_name])
+        remote_checksum <- unname(zenodo_checksums[file_name])
+
+        !file.exists(out_path) || is.na(remote_checksum) ||
+          !sidecar_is_current(
+            download_filepath = out_path,
+            entity_key = file_name,
+            remote_checksum = remote_checksum,
+            sidecar_suffix = ".zenodo.rds",
+            algo = "md5"
+          )
+      },
+      FUN.VALUE = logical(1)
+    )]
   }
 
-  # Helper function to clean up files created during a failed run
-  cleanup_partial_files <- function() {
-    current_files <- out_files[file.exists(out_files)]
-    newly_created_files <- setdiff(current_files, pre_existing_files)
-    if (length(newly_created_files) > 0) {
-      cli::cli_alert_warning(
-        "Download interrupted. Removing {length(newly_created_files)} incomplete/corrupted file{?s}..."
-      )
-      unlink(newly_created_files)
-    }
-  }
+  will_download <- length(files_to_download) > 0
 
-  # Attempt download, watching for indications of a timeout issue
-  tryCatch({
-    zen4R::download_zenodo(
-      path = download_folder,
-      doi = "10.5281/zenodo.4304567",
-      files = target_files,
-      timeout = timeout_length
+  # Only warn about the scale of downloads when at least one will happen
+  if (will_download) {
+    cli::cli_alert_info(
+      "One or more files need to be downloaded. The riverSR files total more than 13GB so the download may take some time."
     )
-  }, warning = function(w) {
-    # Catch md5sum mismatch, length mismatch, or explicit timeout warnings
-    if (grepl("md5sum|downloaded length|timeout|cannot open URL", w$message, ignore.case = TRUE)) {
+  }
+
+  # Helper to clean up files written during a failed run. Files that are being
+  # kept are never in the download set, so the cleanup cannot remove them.
+  cleanup_partial_files <- function() {
+    download_paths <- unname(out_files[files_to_download])
+    incomplete_files <- download_paths[file.exists(download_paths)]
+
+    if (length(incomplete_files) > 0) {
+      cli::cli_alert_warning(
+        "Download interrupted. Removing {length(incomplete_files)} incomplete/corrupted file{?s}..."
+      )
+      unlink(incomplete_files)
+    }
+  }
+
+  if (will_download) {
+    # Checksums reported by Zenodo, recorded in the sidecars of new downloads
+    if (is.null(zenodo_checksums)) {
+      zenodo_checksums <- pull_zenodo_files(doi = riverSR_doi)
+    }
+
+    # Attempt download, watching for indications of a timeout issue
+    tryCatch({
+      zen4R::download_zenodo(
+        path = download_folder,
+        doi = riverSR_doi,
+        files = files_to_download,
+        timeout = timeout_length
+      )
+    }, warning = function(w) {
+      # Catch md5sum mismatch, length mismatch, or explicit timeout warnings
+      if (grepl("md5sum|downloaded length|timeout|cannot open URL", w$message, ignore.case = TRUE)) {
+        cleanup_partial_files()
+        cli::cli_abort(c(
+          "x" = "The download failed, timed out, or resulted in corrupted files.",
+          "i" = "Original system warning: {w$message}"
+        ))
+      } else {
+        warning(w)
+      }
+    }, error = function(e) {
+      # Catch any hard errors thrown by zen4R or the internet connection
       cleanup_partial_files()
       cli::cli_abort(c(
-        "x" = "The download failed, timed out, or resulted in corrupted files.",
-        "i" = "Original system warning: {w$message}"
+        "x" = "A fatal error occurred during the download.",
+        "i" = "Original system error: {e$message}"
       ))
-    } else {
-      warning(w)
-    }
-  }, error = function(e) {
-    # Catch any hard errors thrown by zen4R or the internet connection
-    cleanup_partial_files()
-    cli::cli_abort(c(
-      "x" = "A fatal error occurred during the download.",
-      "i" = "Original system error: {e$message}"
-    ))
-  })
+    })
 
-  if (all(file.exists(out_files))) {
-    cli::cli_alert_success("Download complete.")
-    cli::cli_alert_info(
-      paste0(
-        "RiverSR recommended citation: John Gardner, Xiao Yang, Simon Topp, Matthew Ross,",
-        " Tamlin Pavelsky, & Elizabeth Altenau. (2020). River Surface Reflectance",
-        " Database (RiverSR) (v1.1.0) [Data set]. Zenodo. https://doi.org/10.5281/zenodo.4304567.",
-        " Accessed {Sys.Date()}."
+    # Record a checksum sidecar next to each newly downloaded file
+    for (file_name in files_to_download) {
+      remote_checksum <- unname(zenodo_checksums[file_name])
+      if (is.na(remote_checksum)) {
+        cli::cli_abort(c(
+          "x" = "{.val {file_name}} downloaded successfully, but the Zenodo record did not report a checksum for it.",
+          "i" = "The downloaded file is complete and safe to use. However, it may be re-downloaded on a future run because we could not save a checksum to verify it against.",
+          "i" = "This usually means the Zenodo record has changed. Please check the record at {.url https://doi.org/10.5281/zenodo.4304567} and report this at {.url https://github.com/AquaSat/AquaMatchr/issues}."
+        ), call = NULL)
+      }
+
+      out_path <- unname(out_files[file_name])
+      saveRDS(
+        list(
+          entity_key = file_name,
+          doi = riverSR_doi,
+          remote_checksum = remote_checksum,
+          local_checksum = generate_local_checksum(out_path, algo = "md5"),
+          checked_at = Sys.time()
+        ),
+        file = paste0(out_path, ".zenodo.rds")
       )
-    )
-    return(invisible(out_files))
-  } else {
+    }
+  }
+
+  if (!all(file.exists(out_files))) {
     # Identify which files failed to download for an informative error message
     missing_files <- target_files[!file.exists(out_files)]
     cli::cli_abort(
@@ -225,6 +311,27 @@ download_riverSR <- function(download_folder, timeout_length = 6000, force = FAL
              paste(missing_files, collapse = ", "))
     )
   }
+
+  # Confirm what happened for each file
+  for (file_name in target_files) {
+    if (file_name %in% files_to_download) {
+      cli::cli_alert_success("Downloaded {.val {file_name}}.")
+    } else {
+      cli::cli_alert_info("Using current local file {.file {file_name}}.")
+    }
+  }
+
+  # Suggest citation
+  cli::cli_alert_info(
+    paste0(
+      "RiverSR recommended citation: John Gardner, Xiao Yang, Simon Topp, Matthew Ross,",
+      " Tamlin Pavelsky, & Elizabeth Altenau. (2020). River Surface Reflectance",
+      " Database (RiverSR) (v1.1.0) [Data set]. Zenodo. https://doi.org/10.5281/zenodo.4304567.",
+      " Accessed {Sys.Date()}."
+    )
+  )
+
+  invisible(out_files)
 }
 
 #' Download siteSR dataset from EDI
@@ -243,6 +350,16 @@ download_riverSR <- function(download_folder, timeout_length = 6000, force = FAL
 #' * siteSR data from Landsat 8 (.feather)
 #' * siteSR data from Landsat 9 (.feather)
 #'
+#' When a file is downloaded, a small metadata file (a "sidecar") is created
+#' containing information about the file. The "if_changed" option
+#' re-downloads siteSR files if the corresponding sidecar is
+#' missing, the remote file has changed, or the local copy has been modified.
+#' "never" keeps existing files as-is without checking their version. Matching
+#' filenames are not treated as evidence that the files themselves are up-to-date.
+#' Note that in "if_changed" mode, the local file's checksum is recomputed on
+#' every call, which can take several seconds for the multi-gigabyte siteSR
+#' Feather files.
+#'
 #' @note
 #' The downloaded datasets will be large (several GB in size in total), so users
 #' will need to make sure that they have appropriate available storage for the files.
@@ -252,12 +369,21 @@ download_riverSR <- function(download_folder, timeout_length = 6000, force = FAL
 #' @param algal_mask Logical. If TRUE, the algal mask version of the dataset (DSWE1a)
 #' will be downloaded. Otherwise DSWE1 is used (i.e., FALSE).
 #' @param version Either "newest" or an integer corresponding to the data package
-#' version to use.
-#' @param ask Logical. Should the user be asked before downloading and overwriting
-#' siteSR files that already exist locally?
+#' version to use. The newest version of lakeSR handoff coefficients is used
+#' regardless of what is provided to `version`.
+#' @param update Character. How should updates to existing files be handled? Options are:
+#' + "ask": prompt before replacing an existing local file
+#' + "always": download and replace it
+#' + "never": reuse the local file whenever it exists
+#' + "if_changed": reuse a local file if the selected remote version is unchanged
+#' and the local copy has not been modified; otherwise download it
+#'
+#' Note that with "ask", the main siteSR Landsat files are handled with a single ask
+#' prompt for the entire group. The siteSR sites list and lakeSR handoff files each
+#' have their own user prompt.
 #'
 #' @return A named character vector containing the local file paths for all
-#' downloaded siteSR datasets. Returned invisibly.
+#' requested files (either downloaded or reused). Returned invisibly.
 #' @export
 #'
 #' @importFrom purrr map walk
@@ -271,32 +397,35 @@ download_riverSR <- function(download_folder, timeout_length = 6000, force = FAL
 #' }
 
 download_siteSR <- function(download_folder, algal_mask = FALSE, version = "newest",
-                            ask = TRUE){
+                            update = "ask"){
+
+  # Check update argument input
+  update <- check_update_arg(update)
 
   # siteSR EDI ID
   site_sr_id <- construct_id(identifier = 2254, version = version)
 
   # Filenames to be used for dswe1 and 1a, respectively:
   dswe1_names <- c(
-    "siteSR_Landsat4_DSWE1_2025-06-06.feather",
-    "siteSR_Landsat5_DSWE1_2025-06-06.feather",
-    "siteSR_Landsat7_DSWE1_2025-06-06.feather",
-    "siteSR_Landsat8_DSWE1_2025-06-06.feather",
-    "siteSR_Landsat9_DSWE1_2025-06-06.feather"
+    "siteSR_Landsat4_DSWE1.feather",
+    "siteSR_Landsat5_DSWE1.feather",
+    "siteSR_Landsat7_DSWE1.feather",
+    "siteSR_Landsat8_DSWE1.feather",
+    "siteSR_Landsat9_DSWE1.feather"
   )
 
   dswe1a_names <- c(
-    "siteSR_Landsat4_DSWE1a_2025-06-06.feather",
-    "siteSR_Landsat5_DSWE1a_2025-06-06.feather",
-    "siteSR_Landsat7_DSWE1a_2025-06-06.feather",
-    "siteSR_Landsat8_DSWE1a_2025-06-06.feather",
-    "siteSR_Landsat9_DSWE1a_2025-06-06.feather"
+    "siteSR_Landsat4_DSWE1a.feather",
+    "siteSR_Landsat5_DSWE1a.feather",
+    "siteSR_Landsat7_DSWE1a.feather",
+    "siteSR_Landsat8_DSWE1a.feather",
+    "siteSR_Landsat9_DSWE1a.feather"
   )
 
   # No algal mask (DWSE1)
   if(!algal_mask){
 
-    if(ask == TRUE){
+    if(update == "ask"){
       # Check if any files with the standard names are already present in the save
       # location:
       if(any(file.exists(file.path(download_folder, dswe1_names)))) {
@@ -305,6 +434,7 @@ download_siteSR <- function(download_folder, algal_mask = FALSE, version = "newe
         # Act on input
         if (user_decision == "yes") {
           cli::cli_alert_info("Proceeding with download.")
+          # Treat as an always download
         } else {
           cli::cli_abort("Cancelled by user.")
         }
@@ -317,7 +447,7 @@ download_siteSR <- function(download_folder, algal_mask = FALSE, version = "newe
     # With algal mask (DSWE1a)
   } else if(algal_mask){
 
-    if(ask == TRUE){
+    if(update == "ask"){
       # Check if any files with the standard names are already present in the save
       # location:
       if(any(file.exists(file.path(download_folder, dswe1a_names)))) {
@@ -326,6 +456,7 @@ download_siteSR <- function(download_folder, algal_mask = FALSE, version = "newe
         # Act on input
         if (user_decision == "yes") {
           cli::cli_alert_info("Proceeding with download.")
+          # Treat as an always download
         } else {
           cli::cli_abort("Cancelled by user.")
         }
@@ -336,7 +467,26 @@ download_siteSR <- function(download_folder, algal_mask = FALSE, version = "newe
       dplyr::filter(grepl(pattern = "DSWE = 1a", x = entityName))
   }
 
-  cli::cli_alert_info("This is a series of large downloads. It will take several minutes.")
+  # Confirm EDI returned the expected entities before name-based lookups
+  if (nrow(dl_entities) != length(dswe1_names) ||
+      anyDuplicated(dl_entities$entityName) > 0) {
+    cli::cli_abort(c(
+      "Expected {length(dswe1_names)} unique siteSR data entities in package",
+      "{.val {site_sr_id}}, but found {nrow(dl_entities)}.",
+      "i" = "The contents of the EDI package may have changed."
+    ))
+  }
+
+  # Only warn about the scale of downloads when at least one is certain or
+  # likely to happen
+  will_download <- update == "always" ||
+    !all(file.exists(file.path(download_folder,
+                               if (algal_mask) dswe1a_names else dswe1_names)))
+  if (will_download) {
+    cli::cli_alert_info(
+      "One or more files need to be downloaded. Downloads may be several GB and can take several minutes."
+    )
+  }
 
   # For each param, read, message citation, and save in list
   dl_list <- split(dl_entities, f = dl_entities$entityName) %>%
@@ -344,30 +494,51 @@ download_siteSR <- function(download_folder, algal_mask = FALSE, version = "newe
                    .f = ~{
                      out_name <- switch(
                        .x$entityName,
-                       "siteSR data from Landsat 4, DSWE filter for confident water (DSWE = 1)" = "siteSR_Landsat4_DSWE1_2025-06-06.feather",
-                       "siteSR data from Landsat 4, DSWE filter for confident water and algal mask (DSWE = 1a)" = "siteSR_Landsat4_DSWE1a_2025-06-06.feather",
-                       "siteSR data from Landsat 5, DSWE filter for confident water (DSWE = 1)" = "siteSR_Landsat5_DSWE1_2025-06-06.feather",
-                       "siteSR data from Landsat 5, DSWE filter for confident water and algal mask (DSWE = 1a)" = "siteSR_Landsat5_DSWE1a_2025-06-06.feather",
-                       "siteSR data from Landsat 7, DSWE filter for confident water (DSWE = 1)" = "siteSR_Landsat7_DSWE1_2025-06-06.feather",
-                       "siteSR data from Landsat 7, DSWE filter for confident water and algal mask (DSWE = 1a)" = "siteSR_Landsat7_DSWE1a_2025-06-06.feather",
-                       "siteSR data from Landsat 8, DSWE filter for confident water (DSWE = 1)" = "siteSR_Landsat8_DSWE1_2025-06-06.feather",
-                       "siteSR data from Landsat 8, DSWE filter for confident water and algal mask (DSWE = 1a)" = "siteSR_Landsat8_DSWE1a_2025-06-06.feather",
-                       "siteSR data from Landsat 9, DSWE filter for confident water (DSWE = 1)" = "siteSR_Landsat9_DSWE1_2025-06-06.feather",
-                       "siteSR data from Landsat 9, DSWE filter for confident water and algal mask (DSWE = 1a)" = "siteSR_Landsat9_DSWE1a_2025-06-06.feather"
+                       "siteSR data from Landsat 4, DSWE filter for confident water (DSWE = 1)" = "siteSR_Landsat4_DSWE1.feather",
+                       "siteSR data from Landsat 4, DSWE filter for confident water and algal mask (DSWE = 1a)" = "siteSR_Landsat4_DSWE1a.feather",
+                       "siteSR data from Landsat 5, DSWE filter for confident water (DSWE = 1)" = "siteSR_Landsat5_DSWE1.feather",
+                       "siteSR data from Landsat 5, DSWE filter for confident water and algal mask (DSWE = 1a)" = "siteSR_Landsat5_DSWE1a.feather",
+                       "siteSR data from Landsat 7, DSWE filter for confident water (DSWE = 1)" = "siteSR_Landsat7_DSWE1.feather",
+                       "siteSR data from Landsat 7, DSWE filter for confident water and algal mask (DSWE = 1a)" = "siteSR_Landsat7_DSWE1a.feather",
+                       "siteSR data from Landsat 8, DSWE filter for confident water (DSWE = 1)" = "siteSR_Landsat8_DSWE1.feather",
+                       "siteSR data from Landsat 8, DSWE filter for confident water and algal mask (DSWE = 1a)" = "siteSR_Landsat8_DSWE1a.feather",
+                       "siteSR data from Landsat 9, DSWE filter for confident water (DSWE = 1)" = "siteSR_Landsat9_DSWE1.feather",
+                       "siteSR data from Landsat 9, DSWE filter for confident water and algal mask (DSWE = 1a)" = "siteSR_Landsat9_DSWE1a.feather"
                      )
 
-                     # Read in data as raw bytes
-                     raw_bytes <- EDIutils::read_data_entity(packageId = site_sr_id,
-                                                             entityId = .x$entityId)
-                     # Parse
-                     temp_file <- arrow::read_feather(raw_bytes)
+                     if (is.null(out_name)) {
+                       cli::cli_abort(
+                         "No standard filename is defined for EDI entity {.val {.x$entityName[[1]]}}."
+                       )
+                     }
 
-                     arrow::write_feather(
-                       x = temp_file,
-                       sink = file.path(download_folder, out_name)
+                     # Location to save remote entity file to
+                     out_path <- file.path(download_folder, out_name)
+                     # File entity ID
+                     entity_id <- .x$entityId[[1]]
+
+                     # Handle the user's input to "update", including necessary
+                     # downloads and updates/writes of the sidecar with version
+                     # checksum metadata
+                     result <- download_w_sidecar(
+                       download_filepath = out_path,
+                       update = if (update == "ask") "always" else update,
+                       entity_key = .x$entityName[[1]],
+                       package_id = site_sr_id,
+                       entity_id = entity_id,
+                       download_to_path = function(out_path) {
+                         # Raw EDI data
+                         raw_bytes <- EDIutils::read_data_entity(site_sr_id, entity_id)
+                         # Into .feather
+                         arrow::write_feather(arrow::read_feather(raw_bytes), out_path)
+                       }
                      )
 
-                     cli::cli_alert_success("Downloaded {.val {(.x$entityName)}} as {.file {out_name}}.")
+                     if (result$downloaded) {
+                       cli::cli_alert_success("Downloaded {.val {(.x$entityName)}} as {.file {out_name}}.")
+                     } else {
+                       cli::cli_alert_info("Using current local file {.file {out_name}}.")
+                     }
 
                      # Return the path to the loop
                      return(file.path(download_folder, out_name))
@@ -379,10 +550,10 @@ download_siteSR <- function(download_folder, algal_mask = FALSE, version = "newe
   # Download site list
   # Check if a site info file with the standard name is already present in the save
   # location:
-  sites_filename <- "siteSR_collated_WQP_NWIS_sites_with_NHD_info_2025-06-04.csv"
+  sites_filename <- "siteSR_collated_WQP_NWIS_sites_with_NHD_info.csv"
   sites_out_name <- file.path(download_folder, sites_filename)
 
-  if(ask == TRUE){
+  if(update == "ask"){
     if(any(file.exists(sites_out_name))) {
       user_decision <- ask_user(algal_mask = FALSE,
                                 which_sr = "generic",
@@ -396,37 +567,44 @@ download_siteSR <- function(download_folder, algal_mask = FALSE, version = "newe
     }
   }
 
-  dl_sites <- EDIutils::read_data_entity_names(packageId = site_sr_id) %>%
-    dplyr::filter(entityName == "siteSR sites list") %>%
-    dplyr::pull(entityId)
-
-  # Read in data as raw bytes
-  raw_site_bytes <- EDIutils::read_data_entity(packageId = site_sr_id,
-                                               entityId = dl_sites)
-  # Parse
-  suppressMessages({
-    temp_site_file <- readr::read_csv(raw_site_bytes)
-  })
-  readr::write_csv(
-    x = temp_site_file,
-    file = sites_out_name
+  dl_sites <- pull_entity_id(
+    package_id = site_sr_id,
+    entity_name = "siteSR sites list"
   )
 
-  cli::cli_alert_success("Downloaded siteSR sites list as {.file {sites_filename}}.")
+  sites_result <- download_w_sidecar(
+    download_filepath = sites_out_name,
+    update = if (update == "ask") "always" else update,
+    entity_key = "siteSR sites list",
+    package_id = site_sr_id,
+    entity_id = dl_sites,
+    download_to_path = function(out_path) {
+      # Raw EDI data
+      raw_bytes <- EDIutils::read_data_entity(site_sr_id, dl_sites)
+      # Into .csv
+      readr::write_csv(
+        readr::read_csv(raw_bytes, show_col_types = FALSE, progress = FALSE),
+        out_path,
+        progress = FALSE
+      )
+    }
+  )
+
+  if (sites_result$downloaded) {
+    cli::cli_alert_success("Downloaded siteSR sites list as {.file {basename(sites_out_name)}}.")
+  } else {
+    cli::cli_alert_info("Using current local file {.file {basename(sites_out_name)}}.")
+  }
 
   # Download handoffs
-  handoff_filename <- "lakeSR_collated_handoffs_GEEv2025-02-12_QAv2025-06-04.csv"
+  handoff_filename <- "lakeSR_collated_handoffs.csv"
   handoff_out_name <- file.path(download_folder, handoff_filename)
 
-  if(ask == TRUE){
-    # Check if a handoff coefficient file with the standard name is already present
-    # in the save location:
-    # (Note that handoffs are part of the lakeSR product, not siteSR)
+  if(update == "ask"){
     if(any(file.exists(handoff_out_name))) {
       user_decision <- ask_user(algal_mask = FALSE,
                                 which_sr = "generic",
                                 file_message = "handoff coefficient")
-
       # Act on input
       if (user_decision == "yes") {
         cli::cli_alert_info("Proceeding with download.")
@@ -435,28 +613,37 @@ download_siteSR <- function(download_folder, algal_mask = FALSE, version = "newe
       }
     }
   }
-
   # lakeSR EDI ID, for handoffs only
   lake_sr_id <- construct_id(identifier = 2114, version = "newest")
 
-  dl_handoff <- EDIutils::read_data_entity_names(packageId = lake_sr_id) %>%
-    dplyr::filter(entityName == "lakeSR handoff coefficients") %>%
-    dplyr::pull(entityId)
-
-  # Read in data as raw bytes
-  raw_site_bytes <- EDIutils::read_data_entity(packageId = lake_sr_id,
-                                               entityId = dl_handoff)
-  # Parse
-  suppressMessages({
-    temp_handoff_file <- readr::read_csv(raw_site_bytes)
-  })
-  readr::write_csv(
-    x = temp_handoff_file,
-    file = handoff_out_name
+  dl_handoff <- pull_entity_id(
+    package_id = lake_sr_id,
+    entity_name = "lakeSR handoff coefficients"
   )
 
-  cli::cli_alert_success("Downloaded handoff coefficients as {.file {handoff_filename}}.")
+  handoff_result <- download_w_sidecar(
+    download_filepath = handoff_out_name,
+    update = if (update == "ask") "always" else update,
+    entity_key = "lakeSR handoff coefficients",
+    package_id = lake_sr_id,
+    entity_id = dl_handoff,
+    download_to_path = function(out_path) {
+      # Raw EDI data
+      raw_bytes <- EDIutils::read_data_entity(lake_sr_id, dl_handoff)
+      # Into .csv
+      readr::write_csv(
+        readr::read_csv(raw_bytes, show_col_types = FALSE, progress = FALSE),
+        out_path,
+        progress = FALSE
+      )
+    }
+  )
 
+  if (handoff_result$downloaded) {
+    cli::cli_alert_success("Downloaded handoff coefficients as {.file {basename(handoff_out_name)}}.")
+  } else {
+    cli::cli_alert_info("Using current local file {.file {basename(handoff_out_name)}}.")
+  }
   # Suggest citation
   cli::cli_alert_info(
     "siteSR recommended citation: {EDIutils::read_data_package_citation(packageId = site_sr_id)}"
@@ -489,6 +676,16 @@ download_siteSR <- function(download_folder, algal_mask = FALSE, version = "newe
 #' * lakeSR data from Landsat 8 (.feather)
 #' * lakeSR data from Landsat 9 (.feather)
 #'
+#' When a file is downloaded, a small metadata file (a "sidecar") is created
+#' containing information about the file. The "if_changed" option
+#' re-downloads lakeSR files if the corresponding sidecar is
+#' missing, the remote file has changed, or the local copy has been modified.
+#' "never" keeps existing files as-is without checking their version. Matching
+#' filenames are not treated as evidence that the files themselves are up-to-date.
+#' Note that in "if_changed" mode, the local file's checksum is recomputed on
+#' every call, which can take several seconds for the multi-gigabyte lakeSR
+#' Feather files.
+#'
 #' @note
 #' The downloaded datasets will be large (several GB in size in total), so users
 #' will need to make sure that they have appropriate available storage for the files.
@@ -499,11 +696,19 @@ download_siteSR <- function(download_folder, algal_mask = FALSE, version = "newe
 #' will be downloaded. Otherwise DSWE1 is used (i.e., FALSE).
 #' @param version Either "newest" or an integer corresponding to the data package
 #' version to use.
-#' @param ask Logical. Should the user be asked before downloading and overwriting
-#' siteSR files that already exist locally?
+#' @param update Character. How should updates to existing files be handled? Options are:
+#' + "ask": prompt before replacing an existing local file
+#' + "always": download and replace it
+#' + "never": reuse the local file whenever it exists
+#' + "if_changed": reuse a local file if the selected remote version is unchanged
+#' and the local copy has not been modified; otherwise download it
+#'
+#' Note that with "ask", the main lakeSR Landsat files are handled with a single ask
+#' prompt for the entire group. The lakeSR sites list and handoff coefficient
+#' files each have their own user prompt.
 #'
 #' @return A named character vector containing the local file paths for all
-#' downloaded datasets. Returned invisibly.
+#' requested files (either downloaded or reused). Returned invisibly.
 #' @export
 #'
 #' @importFrom purrr map walk
@@ -516,32 +721,34 @@ download_siteSR <- function(download_folder, algal_mask = FALSE, version = "newe
 #' download_lakeSR(download_folder = "~/Downloads/", algal_mask = FALSE)
 #' }
 download_lakeSR <- function(download_folder, algal_mask = FALSE, version = "newest",
-                            ask = TRUE){
+                            update = "ask"){
+
+  update <- check_update_arg(update)
 
   # lakeSR EDI ID
   lake_sr_id <- construct_id(identifier = 2114, version = version)
 
   # Filenames to be used for dswe1 and 1a, respectively:
   dswe1_names <- c(
-    "lakeSR_Landsat4_DSWE1_2025-06-04.feather",
-    "lakeSR_Landsat5_DSWE1_2025-06-04.feather",
-    "lakeSR_Landsat7_DSWE1_2025-06-04.feather",
-    "lakeSR_Landsat8_DSWE1_2025-06-04.feather",
-    "lakeSR_Landsat9_DSWE1_2025-06-04.feather"
+    "lakeSR_Landsat4_DSWE1.feather",
+    "lakeSR_Landsat5_DSWE1.feather",
+    "lakeSR_Landsat7_DSWE1.feather",
+    "lakeSR_Landsat8_DSWE1.feather",
+    "lakeSR_Landsat9_DSWE1.feather"
   )
 
   dswe1a_names <- c(
-    "lakeSR_Landsat4_DSWE1a_2025-06-04.feather",
-    "lakeSR_Landsat5_DSWE1a_2025-06-04.feather",
-    "lakeSR_Landsat7_DSWE1a_2025-06-04.feather",
-    "lakeSR_Landsat8_DSWE1a_2025-06-04.feather",
-    "lakeSR_Landsat9_DSWE1a_2025-06-04.feather"
+    "lakeSR_Landsat4_DSWE1a.feather",
+    "lakeSR_Landsat5_DSWE1a.feather",
+    "lakeSR_Landsat7_DSWE1a.feather",
+    "lakeSR_Landsat8_DSWE1a.feather",
+    "lakeSR_Landsat9_DSWE1a.feather"
   )
 
   # No algal mask (DWSE1)
   if(!algal_mask){
 
-    if(ask == TRUE){
+    if(update == "ask"){
       # Check if any files with the standard names are already present in the save
       # location:
       if(any(file.exists(file.path(download_folder, dswe1_names)))) {
@@ -550,6 +757,7 @@ download_lakeSR <- function(download_folder, algal_mask = FALSE, version = "newe
         # Act on input
         if (user_decision == "yes") {
           cli::cli_alert_info("Proceeding with download.")
+          # Treat as an always download
         } else {
           cli::cli_abort("Cancelled by user.")
         }
@@ -562,7 +770,7 @@ download_lakeSR <- function(download_folder, algal_mask = FALSE, version = "newe
     # With algal mask (DSWE1a)
   } else if(algal_mask){
 
-    if(ask == TRUE){
+    if(update == "ask"){
       # Check if any files with the standard names are already present in the save
       # location:
       if(any(file.exists(file.path(download_folder, dswe1a_names)))) {
@@ -571,6 +779,7 @@ download_lakeSR <- function(download_folder, algal_mask = FALSE, version = "newe
         # Act on input
         if (user_decision == "yes") {
           cli::cli_alert_info("Proceeding with download.")
+          # Treat as an always download
         } else {
           cli::cli_abort("Cancelled by user.")
         }
@@ -581,7 +790,26 @@ download_lakeSR <- function(download_folder, algal_mask = FALSE, version = "newe
       dplyr::filter(grepl(pattern = "DSWE = 1a", x = entityName))
   }
 
-  cli::cli_alert_info("This is a series of large downloads. It will take several minutes.")
+  # Confirm EDI returned the expected entities before name-based lookups
+  if (nrow(dl_entities) != length(dswe1_names) ||
+      anyDuplicated(dl_entities$entityName) > 0) {
+    cli::cli_abort(c(
+      "Expected {length(dswe1_names)} unique lakeSR data entities in package",
+      "{.val {lake_sr_id}}, but found {nrow(dl_entities)}.",
+      "i" = "The contents of the EDI package may have changed."
+    ))
+  }
+
+  # Only warn about the scale of downloads when at least one is certain or
+  # likely to happen
+  will_download <- update == "always" ||
+    !all(file.exists(file.path(download_folder,
+                               if (algal_mask) dswe1a_names else dswe1_names)))
+  if (will_download) {
+    cli::cli_alert_info(
+      "One or more files need to be downloaded. Downloads may be several GB and can take several minutes."
+    )
+  }
 
   # For each param, read, message citation, and save in list
   dl_list <- split(dl_entities, f = dl_entities$entityName) %>%
@@ -589,29 +817,51 @@ download_lakeSR <- function(download_folder, algal_mask = FALSE, version = "newe
                    .f = ~{
                      out_name <- switch(
                        .x$entityName,
-                       "lakeSR data from Landsat 4, DSWE filter for confident water (DSWE = 1)" = "lakeSR_Landsat4_DSWE1_2025-06-04.feather",
-                       "lakeSR data from Landsat 4, DSWE filter for confident water and algal mask (DSWE = 1a)" = "lakeSR_Landsat4_DSWE1a_2025-06-04.feather",
-                       "lakeSR data from Landsat 5, DSWE filter for confident water (DSWE = 1)" = "lakeSR_Landsat5_DSWE1_2025-06-04.feather",
-                       "lakeSR data from Landsat 5, DSWE filter for confident water and algal mask (DSWE = 1a)" = "lakeSR_Landsat5_DSWE1a_2025-06-04.feather",
-                       "lakeSR data from Landsat 7, DSWE filter for confident water (DSWE = 1)" = "lakeSR_Landsat7_DSWE1_2025-06-04.feather",
-                       "lakeSR data from Landsat 7, DSWE filter for confident water and algal mask (DSWE = 1a)" = "lakeSR_Landsat7_DSWE1a_2025-06-04.feather",
-                       "lakeSR data from Landsat 8, DSWE filter for confident water (DSWE = 1)" = "lakeSR_Landsat8_DSWE1_2025-06-04.feather",
-                       "lakeSR data from Landsat 8, DSWE filter for confident water and algal mask (DSWE = 1a)" = "lakeSR_Landsat8_DSWE1a_2025-06-04.feather",
-                       "lakeSR data from Landsat 9, DSWE filter for confident water (DSWE = 1)" = "lakeSR_Landsat9_DSWE1_2025-06-04.feather",
-                       "lakeSR data from Landsat 9, DSWE filter for confident water and algal mask (DSWE = 1a)" = "lakeSR_Landsat9_DSWE1a_2025-06-04.feather"
-                     )
-                     # Read in data as raw bytes
-                     raw_bytes <- EDIutils::read_data_entity(packageId = lake_sr_id,
-                                                             entityId = .x$entityId)
-                     # Parse
-                     temp_file <- arrow::read_feather(raw_bytes)
-
-                     arrow::write_feather(
-                       x = temp_file,
-                       sink = file.path(download_folder, out_name)
+                       "lakeSR data from Landsat 4, DSWE filter for confident water (DSWE = 1)" = "lakeSR_Landsat4_DSWE1.feather",
+                       "lakeSR data from Landsat 4, DSWE filter for confident water and algal mask (DSWE = 1a)" = "lakeSR_Landsat4_DSWE1a.feather",
+                       "lakeSR data from Landsat 5, DSWE filter for confident water (DSWE = 1)" = "lakeSR_Landsat5_DSWE1.feather",
+                       "lakeSR data from Landsat 5, DSWE filter for confident water and algal mask (DSWE = 1a)" = "lakeSR_Landsat5_DSWE1a.feather",
+                       "lakeSR data from Landsat 7, DSWE filter for confident water (DSWE = 1)" = "lakeSR_Landsat7_DSWE1.feather",
+                       "lakeSR data from Landsat 7, DSWE filter for confident water and algal mask (DSWE = 1a)" = "lakeSR_Landsat7_DSWE1a.feather",
+                       "lakeSR data from Landsat 8, DSWE filter for confident water (DSWE = 1)" = "lakeSR_Landsat8_DSWE1.feather",
+                       "lakeSR data from Landsat 8, DSWE filter for confident water and algal mask (DSWE = 1a)" = "lakeSR_Landsat8_DSWE1a.feather",
+                       "lakeSR data from Landsat 9, DSWE filter for confident water (DSWE = 1)" = "lakeSR_Landsat9_DSWE1.feather",
+                       "lakeSR data from Landsat 9, DSWE filter for confident water and algal mask (DSWE = 1a)" = "lakeSR_Landsat9_DSWE1a.feather"
                      )
 
-                     cli::cli_alert_success("Downloaded {.val {(.x$entityName)}} as {.file {out_name}}.")
+                     if (is.null(out_name)) {
+                       cli::cli_abort(
+                         "No standard filename is defined for EDI entity {.val {.x$entityName[[1]]}}."
+                       )
+                     }
+
+                     # Location to save remote entity file to
+                     out_path <- file.path(download_folder, out_name)
+                     # File entity ID
+                     entity_id <- .x$entityId[[1]]
+
+                     # Handle the user's input to "update", including necessary
+                     # downloads and updates/writes of the sidecar with version
+                     # checksum metadata
+                     result <- download_w_sidecar(
+                       download_filepath = out_path,
+                       update = if (update == "ask") "always" else update,
+                       entity_key = .x$entityName[[1]],
+                       package_id = lake_sr_id,
+                       entity_id = entity_id,
+                       download_to_path = function(out_path) {
+                         # Raw EDI data
+                         raw_bytes <- EDIutils::read_data_entity(lake_sr_id, entity_id)
+                         # Into .feather
+                         arrow::write_feather(arrow::read_feather(raw_bytes), out_path)
+                       }
+                     )
+
+                     if (result$downloaded) {
+                       cli::cli_alert_success("Downloaded {.val {(.x$entityName)}} as {.file {out_name}}.")
+                     } else {
+                       cli::cli_alert_info("Using current local file {.file {out_name}}.")
+                     }
 
                      # Return the path to the loop
                      return(file.path(download_folder, out_name))
@@ -621,12 +871,12 @@ download_lakeSR <- function(download_folder, algal_mask = FALSE, version = "newe
   names(dl_list) <- basename(dl_list)
 
   # Download poi list
-  lakes_filename <- "lakeSR_poi_with_flags_2025-02-12.csv"
+  # Check if a lake info file with the standard name is already present in the
+  # save location:
+  lakes_filename <- "lakeSR_poi_with_flags.csv"
   lakes_out_name <- file.path(download_folder, lakes_filename)
 
-  if(ask == TRUE){
-    # Check if a lake info file with the standard name is already present in the
-    # save location:
+  if(update == "ask"){
     if(any(file.exists(lakes_out_name))) {
       user_decision <- ask_user(algal_mask = FALSE,
                                 which_sr = "generic",
@@ -635,36 +885,47 @@ download_lakeSR <- function(download_folder, algal_mask = FALSE, version = "newe
       # Act on input
       if (user_decision == "yes") {
         cli::cli_alert_info("Proceeding with download.")
+        # Treat as an always download
       } else {
         cli::cli_abort("Cancelled by user.")
       }
     }
   }
-  dl_lakes <- EDIutils::read_data_entity_names(packageId = lake_sr_id) %>%
-    dplyr::filter(entityName == "lakeSR sites list") %>%
-    dplyr::pull(entityId)
 
-  # Read in data as raw bytes
-  raw_lake_bytes <- EDIutils::read_data_entity(packageId = lake_sr_id,
-                                               entityId = dl_lakes)
-  # Parse
-  suppressMessages({
-    temp_lake_file <- readr::read_csv(raw_lake_bytes)
-  })
-  readr::write_csv(
-    x = temp_lake_file,
-    file = lakes_out_name
+  dl_lakes <- pull_entity_id(
+    package_id = lake_sr_id,
+    entity_name = "lakeSR sites list"
   )
 
-  cli::cli_alert_success("Downloaded lakeSR sites list as {.file {lakes_filename}}.")
+  lakes_result <- download_w_sidecar(
+    download_filepath = lakes_out_name,
+    update = if (update == "ask") "always" else update,
+    entity_key = "lakeSR sites list",
+    package_id = lake_sr_id,
+    entity_id = dl_lakes,
+    download_to_path = function(out_path) {
+      # Raw EDI data
+      raw_bytes <- EDIutils::read_data_entity(lake_sr_id, dl_lakes)
+      # Into .csv
+      readr::write_csv(
+        readr::read_csv(raw_bytes, show_col_types = FALSE, progress = FALSE),
+        out_path,
+        progress = FALSE
+      )
+    }
+  )
+
+  if (lakes_result$downloaded) {
+    cli::cli_alert_success("Downloaded lakeSR sites list as {.file {basename(lakes_out_name)}}.")
+  } else {
+    cli::cli_alert_info("Using current local file {.file {basename(lakes_out_name)}}.")
+  }
 
   # Download handoffs
-  handoff_filename <- "lakeSR_collated_handoffs_GEEv2025-02-12_QAv2025-06-04.csv"
+  handoff_filename <- "lakeSR_collated_handoffs.csv"
   handoff_out_name <- file.path(download_folder, handoff_filename)
 
-  if(ask == TRUE){
-    # Check if a handoff coefficient file with the standard name is already present
-    # in the save location:
+  if(update == "ask"){
     if(any(file.exists(handoff_out_name))) {
       user_decision <- ask_user(algal_mask = FALSE,
                                 which_sr = "generic",
@@ -673,28 +934,41 @@ download_lakeSR <- function(download_folder, algal_mask = FALSE, version = "newe
       # Act on input
       if (user_decision == "yes") {
         cli::cli_alert_info("Proceeding with download.")
+        # Treat as an always download
       } else {
         cli::cli_abort("Cancelled by user.")
       }
     }
   }
-  dl_handoff <- EDIutils::read_data_entity_names(packageId = lake_sr_id) %>%
-    dplyr::filter(entityName == "lakeSR handoff coefficients") %>%
-    dplyr::pull(entityId)
 
-  # Read in data as raw bytes
-  raw_site_bytes <- EDIutils::read_data_entity(packageId = lake_sr_id,
-                                               entityId = dl_handoff)
-  # Parse
-  suppressMessages({
-    temp_handoff_file <- readr::read_csv(raw_site_bytes)
-  })
-  readr::write_csv(
-    x = temp_handoff_file,
-    file = handoff_out_name
+  dl_handoff <- pull_entity_id(
+    package_id = lake_sr_id,
+    entity_name = "lakeSR handoff coefficients"
   )
 
-  cli::cli_alert_success("Downloaded handoff coefficients as {.file {handoff_filename}}.")
+  handoff_result <- download_w_sidecar(
+    download_filepath = handoff_out_name,
+    update = if (update == "ask") "always" else update,
+    entity_key = "lakeSR handoff coefficients",
+    package_id = lake_sr_id,
+    entity_id = dl_handoff,
+    download_to_path = function(out_path) {
+      # Raw EDI data
+      raw_bytes <- EDIutils::read_data_entity(lake_sr_id, dl_handoff)
+      # Into .csv
+      readr::write_csv(
+        readr::read_csv(raw_bytes, show_col_types = FALSE, progress = FALSE),
+        out_path,
+        progress = FALSE
+      )
+    }
+  )
+
+  if (handoff_result$downloaded) {
+    cli::cli_alert_success("Downloaded handoff coefficients as {.file {basename(handoff_out_name)}}.")
+  } else {
+    cli::cli_alert_info("Using current local file {.file {basename(handoff_out_name)}}.")
+  }
 
   # Suggest citation
   cli::cli_alert_info(
@@ -736,6 +1010,15 @@ download_lakeSR <- function(download_folder, algal_mask = FALSE, version = "newe
 #' `system:index`) that can be used to join scene-level metadata back onto
 #' siteSR/lakeSR rows, which carry the same `sat_id`.
 #'
+#' When a file is downloaded, a small metadata file (a "sidecar") is created
+#' containing information about the file. The "if_changed" option
+#' re-downloads a scene metadata file if its sidecar is missing, the remote
+#' file has changed, or the local copy has been modified. "never" keeps existing
+#' files as-is without checking their version. Matching filenames are not
+#' treated as evidence that the files themselves are up-to-date.
+#' Because the scene-level metadata content is identical in the siteSR and
+#' lakeSR packages and sidecars are keyed on the EDI entity name, "if_changed"
+#' may reuse a file that was originally downloaded via the other `product`.
 #'
 #' @param download_folder A string containing the path to the folder where the
 #' dataset should be saved.
@@ -745,17 +1028,23 @@ download_lakeSR <- function(download_folder, algal_mask = FALSE, version = "newe
 #' particular package's revision lineage.
 #' @param version Either "newest" or an integer corresponding to the data
 #' package version to use.
-#' @param ask Logical. Should the user be asked before downloading and
-#' overwriting scene metadata files that already exist locally?
+#' @param update Character. How should updates to existing files be handled? Options are:
+#' + "ask": prompt before replacing an existing local file
+#' + "always": download and replace it
+#' + "never": reuse the local file whenever it exists
+#' + "if_changed": reuse a local file if the selected remote version is unchanged
+#' and the local copy has not been modified; otherwise download it
+#'
+#' Note that with "ask", a single prompt covers both scene metadata files.
 #'
 #' @return A named character vector containing the local file paths for the
-#' downloaded scene metadata datasets. Returned invisibly.
+#' scene metadata datasets (either downloaded or reused). Returned invisibly.
 #'
 #' @note The downloaded files are large (tens of MB each), so make sure you have
 #' appropriate available storage.
 #' @export
 #'
-#' @importFrom purrr map_chr
+#' @importFrom purrr map_chr imap_chr
 #' @importFrom EDIutils read_data_package_citation read_data_entity_names read_data_entity
 #' @importFrom readr read_csv write_csv
 #' @importFrom cli cli_alert_info cli_alert_success cli_abort
@@ -765,7 +1054,9 @@ download_lakeSR <- function(download_folder, algal_mask = FALSE, version = "newe
 #' download_sceneMetadata(download_folder = "~/Downloads/", product = "siteSR")
 #' }
 download_sceneMetadata <- function(download_folder, product = c("siteSR", "lakeSR"),
-                                   version = "newest", ask = TRUE){
+                                   version = "newest", update = "ask"){
+
+  update <- check_update_arg(update)
 
   # Resolve which EDI package to pull from
   product <- match.arg(product)
@@ -774,16 +1065,16 @@ download_sceneMetadata <- function(download_folder, product = c("siteSR", "lakeS
   # Scene metadata EDI ID
   scene_id <- construct_id(identifier = identifier, version = version)
 
-  # Filenames to be used for the two scene metadata files:
-  scene_names <- c(
-    "sceneMetadata_Landsat457.csv",
-    "sceneMetadata_Landsat89.csv"
+  # EDI entity names mapped to the standard local filenames:
+  scene_files <- c(
+    "reduced column scene-level metadata for Landsat 4, 5, and 7" = "sceneMetadata_Landsat457.csv",
+    "reduced column scene-level metadata for Landsat 8 and 9" = "sceneMetadata_Landsat89.csv"
   )
 
-  if(ask == TRUE){
+  if(update == "ask"){
     # Check if any files with the standard names are already present in the save
     # location:
-    if(any(file.exists(file.path(download_folder, scene_names)))) {
+    if(any(file.exists(file.path(download_folder, scene_files)))) {
       user_decision <- ask_user(algal_mask = FALSE,
                                 which_sr = "generic",
                                 file_message = "scene-level metadata")
@@ -791,46 +1082,65 @@ download_sceneMetadata <- function(download_folder, product = c("siteSR", "lakeS
       # Act on input
       if (user_decision == "yes") {
         cli::cli_alert_info("Proceeding with download.")
+        # Treat as an always download
       } else {
         cli::cli_abort("Cancelled by user.")
       }
     }
   }
 
-  # Get EDI entity names
-  dl_entities <- EDIutils::read_data_entity_names(packageId = scene_id) %>%
-    dplyr::filter(grepl(pattern = "^reduced column scene-level metadata", x = entityName))
-
-  cli::cli_alert_info("This is a large download. It may take a few minutes.")
+  # Only warn about the scale of downloads when at least one is certain or
+  # likely to happen
+  will_download <- update == "always" ||
+    !all(file.exists(file.path(download_folder, scene_files)))
+  if (will_download) {
+    cli::cli_alert_info(
+      "One or more files need to be downloaded. Downloads may be tens of MB and can take a few minutes."
+    )
+  }
 
   # For each entity, read, message, and save
-  dl_list <- split(dl_entities, f = dl_entities$entityName) %>%
-    purrr::map_chr(.x = .,
-                   .f = ~{
-                     out_name <- switch(
-                       .x$entityName,
-                       "reduced column scene-level metadata for Landsat 4, 5, and 7" = "sceneMetadata_Landsat457.csv",
-                       "reduced column scene-level metadata for Landsat 8 and 9" = "sceneMetadata_Landsat89.csv"
-                     )
+  dl_list <- purrr::imap_chr(
+    scene_files,
+    function(out_name, entity_name) {
+      entity_id <- pull_entity_id(
+        package_id = scene_id,
+        entity_name = entity_name
+      )
 
-                     # Read in data as raw bytes
-                     raw_bytes <- EDIutils::read_data_entity(packageId = scene_id,
-                                                             entityId = .x$entityId)
-                     # Parse
-                     suppressMessages({
-                       temp_file <- readr::read_csv(raw_bytes, show_col_types = FALSE)
-                     })
+      # Location to save remote entity file to
+      out_path <- file.path(download_folder, out_name)
 
-                     readr::write_csv(
-                       x = temp_file,
-                       file = file.path(download_folder, out_name)
-                     )
+      # Handle the user's input to "update", including necessary downloads and
+      # updates/writes of the sidecar with version checksum metadata
+      result <- download_w_sidecar(
+        download_filepath = out_path,
+        update = if (update == "ask") "always" else update,
+        entity_key = entity_name,
+        package_id = scene_id,
+        entity_id = entity_id,
+        download_to_path = function(out_path) {
+          # Raw EDI data
+          raw_bytes <- EDIutils::read_data_entity(scene_id, entity_id)
+          # Into .csv
+          readr::write_csv(
+            readr::read_csv(raw_bytes, show_col_types = FALSE, progress = FALSE),
+            out_path,
+            progress = FALSE
+          )
+        }
+      )
 
-                     cli::cli_alert_success("Downloaded {.val {(.x$entityName)}} as {.file {out_name}}.")
+      if (result$downloaded) {
+        cli::cli_alert_success("Downloaded {.val {entity_name}} as {.file {out_name}}.")
+      } else {
+        cli::cli_alert_info("Using current local file {.file {out_name}}.")
+      }
 
-                     # Return the path to the loop
-                     return(file.path(download_folder, out_name))
-                   })
+      # Return the path to the loop
+      out_path
+    }
+  )
 
   # Clean and store filenames
   names(dl_list) <- basename(dl_list)

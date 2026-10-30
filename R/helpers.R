@@ -141,6 +141,221 @@ construct_id <- function(identifier, version){
 
 }
 
+#' Generate checksum for local file
+#'
+#' @param file_path The path to the local file
+#' @param algo The checksum algorithm to use. Defaults to "sha1".
+#'
+#' @returns A single checksum string for the file at `file_path`
+#' @noRd
+generate_local_checksum <- function(file_path, algo = "sha1"){
+  digest::digest(object = file_path, algo = algo, file = TRUE)
+}
+
+#' Return the ID of a single EDI entity by name
+#'
+#' @param package_id EDI data package ID to search in
+#' @param entity_name Name of the entity whose ID should be returned
+#'
+#' @return The entity ID of the single entity named `entity_name` in
+#'   `package_id`. Aborts if zero or multiple entities match, e.g. if the
+#'   contents of the EDI package have changed.
+#' @noRd
+pull_entity_id <- function(package_id, entity_name) {
+  entity_ids <- EDIutils::read_data_entity_names(packageId = package_id) %>%
+    dplyr::filter(entityName == entity_name) %>%
+    dplyr::pull(entityId)
+
+  if (length(entity_ids) != 1L) {
+    cli::cli_abort(c(
+      "Expected exactly one EDI entity named {.val {entity_name}} in package",
+      "{.val {package_id}}, but found {length(entity_ids)}.",
+      "i" = "The contents of the EDI package may have changed."
+    ), call = NULL)
+  }
+
+  entity_ids
+}
+
+#' Validate and normalize the update argument
+#'
+#' @param update Character. How updates to existing files should be handled.
+#'   One of "ask", "always", "never", or "if_changed".
+#'
+#' @return The validated update option, lowercased and whitespace-trimmed.
+#' @noRd
+check_update_arg <- function(update) {
+  # Confirm that input conforms to expectations
+  if (!is.character(update) || length(update) != 1L || is.na(update)) {
+    cli::cli_abort(
+      "{.arg update} must be one of 'ask', 'always', 'never', or 'if_changed'.",
+      call = NULL
+    )
+  }
+
+  # Normalize input
+  update <- tolower(trimws(update))
+
+  # Final check after normalization
+  if (!update %in% c("ask", "always", "never", "if_changed")) {
+    cli::cli_abort(
+      "{.arg update} must be one of 'ask', 'always', 'never', or 'if_changed'.",
+      call = NULL
+    )
+  }
+
+  update
+}
+
+#' Download an EDI entity with a checksum sidecar
+#'
+#' @description
+#' Reuse or replace a local file according to user specified `update`, and record
+#' checksums alongside files written by `download_to_path`.
+#'
+#' @details
+#' The sidecar is saved as `<download_filepath>.edi.rds`. It records the EDI
+#' entity checksum and a separate checksum of the locally saved file. These
+#' checksums may differ when the download callback parses and rewrites the data.
+#' An existing file without a readable, matching sidecar is replaced under
+#' `update = "if_changed"`. A missing file is downloaded in every mode.
+#' The caller handles interactive prompts; this helper does not accept the
+#' `"ask"` update option.
+#'
+#' The file is downloaded to a temporary location in the destination directory
+#' and moved into place once the download finishes, so an interrupted download
+#' does not leave a partial file at the destination.
+#'
+#' @param download_filepath The path to the local output file
+#' @param update Character. One of `"always"`, `"never"`, or `"if_changed"`:
+#'   `"always"` replaces the file; `"never"` keeps an existing file without
+#'   checking its contents; `"if_changed"` reuses it only when the sidecar
+#'   confirms that the selected EDI entity and the local file are unchanged
+#' @param package_id EDI data package ID containing the selected entity
+#' @param entity_id ID of the selected entity within `package_id`
+#' @param entity_key Stable label identifying the entity across package revisions
+#' @param download_to_path A function accepting one output path. It must download
+#'   the selected entity and write the local file to that path
+#'
+#' @return Invisibly, a list with `path` (the local file path) and `downloaded`
+#'   (`TRUE` if written on this call; `FALSE` if an existing file was reused).
+#' @noRd
+#'
+#' @examples
+#' \dontrun{
+#' out_path <- file.path(tempdir(), "sites_list.csv")
+#' site_sr_id <- "edi.2254.1"
+#' entity_key <- "siteSR sites list"
+#' entity_id <- "9d53e6da60d4cef8ff0d59493c84aee6"
+#'
+#' download_w_sidecar(
+#'   download_filepath = out_path,
+#'   update = "always",
+#'   package_id = site_sr_id,
+#'   entity_id = entity_id,
+#'   entity_key = entity_key,
+#'   download_to_path = function(out_path) {
+#'     # Raw EDI data
+#'     raw_bytes <- EDIutils::read_data_entity(site_sr_id, entity_id)
+#'     # Into csv
+#'     readr::write_csv(readr::read_csv(raw_bytes), out_path)
+#'   }
+#' )
+#'
+#' # Check contents
+#' dir(dirname(out_path))
+#' }
+download_w_sidecar <- function(download_filepath, update,
+                               package_id, entity_id, entity_key,
+                               download_to_path){
+  # Check
+  if (!update %in% c("always", "never", "if_changed")) {
+    cli::cli_abort(
+      "{.arg update} must be one of 'always', 'never', or 'if_changed'.",
+      call = NULL
+    )
+  }
+
+  sidecar <- paste0(download_filepath, ".edi.rds")
+  file_is_present <- file.exists(download_filepath) && !dir.exists(download_filepath)
+
+  # If user specifies "never" and the file exists then we can skip
+  if (update == "never" && file_is_present) {
+    return(invisible(list(path = download_filepath, downloaded = FALSE)))
+  }
+
+  remote_checksum <- NULL
+
+  # For "if_changed", compare the current remote entity to the sidecar
+  if (update == "if_changed" && file_is_present) {
+
+    remote_checksum <- EDIutils::read_data_entity_checksum(
+      packageId = package_id, entityId = entity_id
+    )
+    remote_checksum <- tolower(trimws(remote_checksum))
+
+    # Reuse the file only when the sidecar confirms that the remote entity
+    # and the local copy are both unchanged
+    cache_is_current <- sidecar_is_current(
+      download_filepath = download_filepath,
+      entity_key = entity_key,
+      remote_checksum = remote_checksum
+    )
+
+    if (cache_is_current) {
+      return(invisible(list(path = download_filepath, downloaded = FALSE)))
+    }
+  }
+
+  # Download remote entity and create a sidecar for all other cases
+  if (is.null(remote_checksum)) {
+    remote_checksum <- EDIutils::read_data_entity_checksum(
+      packageId = package_id, entityId = entity_id
+    )
+  }
+  remote_checksum <- tolower(trimws(remote_checksum))
+
+  dir.create(dirname(download_filepath), recursive = TRUE, showWarnings = FALSE)
+
+  # Download to a temporary file in the destination directory and move it into
+  # place only once the write finishes, so an interrupted download never
+  # leaves a partial file at the final path
+  temp_path <- tempfile(
+    pattern = paste0(".", basename(download_filepath), "."),
+    tmpdir = dirname(download_filepath)
+  )
+  on.exit(unlink(temp_path), add = TRUE)
+
+  download_to_path(temp_path)
+
+  if (!file.exists(temp_path)) {
+    cli::cli_abort(
+      "{.arg download_to_path} did not create a file at the temporary download location.",
+      call = NULL
+    )
+  }
+  if (!file.rename(temp_path, download_filepath)) {
+    cli::cli_abort(
+      "Could not move the downloaded file into place at {.file {download_filepath}}.",
+      call = NULL
+    )
+  }
+
+  # Construct the sidecar metadata
+  metadata <- list(
+    entity_key = entity_key,
+    package_id = package_id,
+    entity_id = entity_id,
+    remote_checksum = remote_checksum,
+    local_checksum = generate_local_checksum(download_filepath),
+    checked_at = Sys.time()
+  )
+  saveRDS(metadata, sidecar)
+
+  invisible(list(path = download_filepath, downloaded = TRUE))
+}
+
+
 #' Get Arrow schemas for datasets that will be joined
 #'
 #' @description A helper function that generates `arrow::schema()` objects to
@@ -441,4 +656,54 @@ infer_arrow_format <- function(path, allowed = c("csv", "feather", "parquet")) {
   }
 
   format
+}
+
+#' Check whether a checksum sidecar indicates an unchanged local file
+#'
+#' @param download_filepath Path to the local file
+#' @param entity_key Stable label identifying the remote entity
+#' @param remote_checksum Current remote checksum of the entity
+#' @param sidecar_suffix Suffix appended to `download_filepath` to locate the
+#'   sidecar file
+#' @param algo Checksum algorithm used for the local file. Must match the
+#'   algorithm used when the sidecar was written.
+#'
+#' @return TRUE if the sidecar exists and records matching `entity_key` and
+#'   `remote_checksum` values plus an unmodified local file; FALSE otherwise.
+#' @noRd
+sidecar_is_current <- function(download_filepath, entity_key, remote_checksum,
+                               sidecar_suffix = ".edi.rds", algo = "sha1") {
+  sidecar <- paste0(download_filepath, sidecar_suffix)
+
+  metadata <- if (file.exists(sidecar)) {
+    tryCatch(readRDS(sidecar), error = function(e) NULL)
+  } else {
+    NULL
+  }
+
+  remote_matches <- identical(
+    tolower(metadata$remote_checksum),
+    tolower(trimws(remote_checksum))
+  )
+
+  is.list(metadata) &&
+    identical(metadata$entity_key, entity_key) &&
+    remote_matches &&
+    identical(metadata$local_checksum,
+              generate_local_checksum(download_filepath, algo = algo))
+}
+
+#' Fetch file names and checksums from a Zenodo record
+#'
+#' @param doi String. DOI of a published Zenodo record.
+#'
+#' @return A named character vector of lowercase MD5 checksums (hex strings)
+#'   with the record's file names as names.
+#' @noRd
+pull_zenodo_files <- function(doi) {
+  record <- zen4R::ZenodoManager$new()$getRecordByDOI(doi)
+  file_info <- record$listFiles(pretty = TRUE)
+
+  checksums <- tolower(sub("^md5:", "", file_info$checksum))
+  stats::setNames(checksums, file_info$filename)
 }
