@@ -169,7 +169,7 @@ warn_inconsistent_sr_versions <- function(versions) {
   revision_of <- function(package_id) {
     sub("^edi\\.[0-9]+\\.", "", package_id)
   }
-
+  # FUTURE TO DO: add compatibility matrix if we make additional releases to the SR products
   for (product in names(product_ids)) {
     ids <- product_ids[[product]]
 

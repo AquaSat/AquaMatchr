@@ -225,16 +225,16 @@ warn_broken_sr_release <- function(package_id) {
       c(
         paste0(
           "This version of the lakeSR/siteSR data release ({.val {package_id}})",
-          " contains mask errors in the Landsat 8 and 9 data products and should",
+          " contains aerosol masking errors that impact the Landsat 8 and 9 data and should",
           " not be used for final analyses."
         ),
         "i" = paste0(
           "We recommend using it only for planning analyses using the data",
-          " structure. Landsat 4, 5, and 7 data are not affected."
+          " structure. Landsat 4, 5, and 7 data are not affected by this masking error."
         ),
         "i" = paste0(
-          "An updated release is forthcoming that will fix the masking and",
-          " include more recent scene metadata."
+          "An updated release is forthcoming that will fix the masking error, provide data through October 
+          2026, and include additional diagnostic columns. This update is expected in early 2027."
         )
       )
     )
