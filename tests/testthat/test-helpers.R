@@ -83,7 +83,7 @@ test_that("check_time_window() rejects invalid strings and units", {
 test_that("check_cols() identifies exact missing columns dynamically with real schemas", {
 
   # Static snippet files
-  sitelist_path <- testthat::test_path("testdata", "sitelist_2025-06-04_snippet.csv")
+  sitelist_path <- testthat::test_path("testdata", "sitelist_snippet.csv")
   sitesr_path   <- testthat::test_path("testdata", "siteSR_DSWE1_full_concatenation_snippet.parquet")
   wqp_path      <- testthat::test_path("testdata", "chla_harmonized_snippet.feather")
 
@@ -180,5 +180,519 @@ test_that("infer_arrow_format() respects the `allowed` argument", {
   expect_equal(
     infer_arrow_format("x.feather", allowed = c("feather", "parquet")),
     "feather"
+  )
+})
+
+test_that("warn_broken_sr_release() warns only for the known-broken releases", {
+  expect_warning(
+    warn_broken_sr_release("edi.2114.1"),
+    regexp = "mask errors"
+  )
+  expect_warning(
+    warn_broken_sr_release("edi.2254.1"),
+    regexp = "mask errors"
+  )
+
+  # Other revisions and unrelated packages are silent
+  expect_no_warning(warn_broken_sr_release("edi.2114.2"))
+  expect_no_warning(warn_broken_sr_release("edi.2254.2"))
+  expect_no_warning(warn_broken_sr_release("edi.1756.3"))
+})
+
+# Update argument and sidecar machinery ------------------------------------
+
+# Fixed remote checksum returned by the mocked EDI checksum endpoint
+fake_edi_checksum <- "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+
+# Arbitrary stand-in for any checksum that differs from fake_edi_checksum
+different_checksum <- "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+# Mock the EDI checksum endpoint. Must be called from a test body: the mocks
+# are tied to the calling test via .env = parent.frame(), otherwise they would
+# be torn down when this helper returns.
+local_edi_checksum_mock <- function(checksum = fake_edi_checksum) {
+  testthat::local_mocked_bindings(
+    read_data_entity_checksum = function(...) checksum,
+    .package = "EDIutils",
+    .env = parent.frame()
+  )
+}
+
+# Write a sidecar exactly as download_w_sidecar() would after a successful
+# download
+write_edi_sidecar <- function(download_filepath, package_id = "edi.mock.1",
+                              entity_id = "mock_1",
+                              entity_key = "mock entity",
+                              remote_checksum = fake_edi_checksum) {
+  saveRDS(
+    list(
+      entity_key = entity_key,
+      package_id = package_id,
+      entity_id = entity_id,
+      remote_checksum = remote_checksum,
+      local_checksum = generate_local_checksum(download_filepath),
+      checked_at = Sys.time()
+    ),
+    file = paste0(download_filepath, ".edi.rds")
+  )
+}
+
+# Run download_w_sidecar() with the standard mock arguments
+run_sidecar <- function(download_filepath, update, download_to_path,
+                        entity_key = "mock entity",
+                        package_id = "edi.mock.1") {
+  download_w_sidecar(
+    download_filepath = download_filepath,
+    update = update,
+    package_id = package_id,
+    entity_id = "mock_1",
+    entity_key = entity_key,
+    download_to_path = download_to_path
+  )
+}
+
+test_that("check_update_arg() accepts and normalizes valid options", {
+  expect_equal(check_update_arg("ask"), "ask")
+  expect_equal(check_update_arg("always"), "always")
+  expect_equal(check_update_arg("never"), "never")
+  expect_equal(check_update_arg("if_changed"), "if_changed")
+
+  # Case and surrounding whitespace are tolerated
+  expect_equal(check_update_arg("  IF_CHANGED "), "if_changed")
+})
+
+test_that("check_update_arg() aborts on invalid input", {
+  expect_error(check_update_arg("sometimes"), regexp = "must be one of")
+  expect_error(check_update_arg("alway"), regexp = "must be one of")
+  expect_error(check_update_arg(1), regexp = "must be one of")
+  expect_error(check_update_arg(NA_character_), regexp = "must be one of")
+  expect_error(check_update_arg(c("ask", "always")), regexp = "must be one of")
+})
+
+test_that("pull_entity_id() returns the single matching entity ID", {
+  testthat::local_mocked_bindings(
+    read_data_entity_names = function(...) {
+      data.frame(
+        entityName = c("lakeSR sites list", "lakeSR handoff coefficients"),
+        entityId = c("mock_1", "mock_2"),
+        stringsAsFactors = FALSE
+      )
+    },
+    .package = "EDIutils"
+  )
+
+  expect_equal(
+    pull_entity_id(package_id = "edi.mock.1", entity_name = "lakeSR sites list"),
+    "mock_1"
+  )
+})
+
+test_that("pull_entity_id() aborts on zero or multiple matching entities", {
+  testthat::local_mocked_bindings(
+    read_data_entity_names = function(...) {
+      data.frame(
+        entityName = c("duplicate", "duplicate", "unrelated"),
+        entityId = c("mock_1", "mock_2", "mock_3"),
+        stringsAsFactors = FALSE
+      )
+    },
+    .package = "EDIutils"
+  )
+
+  # No matching entities
+  expect_error(
+    pull_entity_id(package_id = "edi.mock.1", entity_name = "missing entity"),
+    regexp = "Expected exactly one EDI entity"
+  )
+  # Two matching entities
+  expect_error(
+    pull_entity_id(package_id = "edi.mock.1", entity_name = "duplicate"),
+    regexp = "Expected exactly one EDI entity"
+  )
+})
+
+test_that("download_w_sidecar() rejects the 'ask' update option", {
+  expect_error(
+    run_sidecar(tempfile(), update = "ask", download_to_path = function(path) NULL),
+    regexp = "must be one of 'always', 'never', or 'if_changed'"
+  )
+})
+
+test_that("download_w_sidecar() with update = 'always' replaces an existing file", {
+  tmp_dir <- withr::local_tempdir()
+  out_path <- file.path(tmp_dir, "data.csv")
+  writeLines("old contents", out_path)
+
+  local_edi_checksum_mock()
+
+  result <- run_sidecar(
+    out_path, update = "always",
+    download_to_path = function(path) writeLines("new contents", path)
+  )
+
+  expect_true(result$downloaded)
+  expect_equal(result$path, out_path)
+  expect_equal(readLines(out_path), "new contents")
+
+  # The sidecar records the remote checksum and the new file's checksum
+  metadata <- readRDS(paste0(out_path, ".edi.rds"))
+  expect_equal(metadata$remote_checksum, fake_edi_checksum)
+  expect_equal(metadata$local_checksum, generate_local_checksum(out_path))
+})
+
+test_that("download_w_sidecar() with update = 'never' reuses an existing file", {
+  tmp_dir <- withr::local_tempdir()
+  out_path <- file.path(tmp_dir, "data.csv")
+  writeLines("current contents", out_path)
+
+  result <- run_sidecar(
+    out_path, update = "never",
+    download_to_path = function(path) stop("download callback should not run")
+  )
+
+  expect_false(result$downloaded)
+  expect_equal(readLines(out_path), "current contents")
+  # No sidecar was needed or written for the reused file
+  expect_false(file.exists(paste0(out_path, ".edi.rds")))
+})
+
+test_that("download_w_sidecar() downloads a missing file even in 'never' mode", {
+  tmp_dir <- withr::local_tempdir()
+  out_path <- file.path(tmp_dir, "data.csv")
+
+  local_edi_checksum_mock()
+
+  result <- run_sidecar(
+    out_path, update = "never",
+    download_to_path = function(path) writeLines("downloaded", path)
+  )
+
+  expect_true(result$downloaded)
+  expect_equal(readLines(out_path), "downloaded")
+  expect_true(file.exists(paste0(out_path, ".edi.rds")))
+})
+
+test_that("download_w_sidecar() with update = 'if_changed' reuses a current file", {
+  tmp_dir <- withr::local_tempdir()
+  out_path <- file.path(tmp_dir, "data.csv")
+  writeLines("current contents", out_path)
+  write_edi_sidecar(out_path)
+
+  local_edi_checksum_mock()
+
+  result <- run_sidecar(
+    out_path, update = "if_changed",
+    download_to_path = function(path) stop("download callback should not run")
+  )
+
+  expect_false(result$downloaded)
+  expect_equal(readLines(out_path), "current contents")
+})
+
+test_that("download_w_sidecar() with update = 'if_changed' makes no EDI checksum request when the sidecar records the requested revision", {
+  tmp_dir <- withr::local_tempdir()
+  out_path <- file.path(tmp_dir, "data.csv")
+  writeLines("current contents", out_path)
+  write_edi_sidecar(out_path)
+
+  # Any attempt to query the EDI checksum endpoint should fail the test
+  testthat::local_mocked_bindings(
+    read_data_entity_checksum = function(...) {
+      stop("the EDI checksum endpoint should not be queried")
+    },
+    .package = "EDIutils"
+  )
+
+  result <- run_sidecar(
+    out_path, update = "if_changed",
+    download_to_path = function(path) stop("download callback should not run")
+  )
+
+  expect_false(result$downloaded)
+  expect_equal(readLines(out_path), "current contents")
+})
+
+test_that("download_w_sidecar() with update = 'if_changed' reuses a file whose entity is unchanged in a newer revision", {
+  tmp_dir <- withr::local_tempdir()
+  out_path <- file.path(tmp_dir, "data.csv")
+  writeLines("current contents", out_path)
+  write_edi_sidecar(out_path, package_id = "edi.mock.1")
+  original_metadata <- readRDS(paste0(out_path, ".edi.rds"))
+
+  # The mock reports the same entity checksum the sidecar recorded, as if the
+  # entity was untouched by the edi.mock.2 revision
+  local_edi_checksum_mock()
+
+  result <- run_sidecar(
+    out_path, update = "if_changed", package_id = "edi.mock.2",
+    download_to_path = function(path) stop("download callback should not run")
+  )
+
+  expect_false(result$downloaded)
+  expect_equal(readLines(out_path), "current contents")
+
+  # The sidecar is updated to the revision the file now matches, but still
+  # records when the file was downloaded
+  metadata <- readRDS(paste0(out_path, ".edi.rds"))
+  expect_equal(metadata$package_id, "edi.mock.2")
+  expect_equal(metadata$checked_at, original_metadata$checked_at)
+  expect_equal(metadata$local_checksum, original_metadata$local_checksum)
+})
+
+test_that("download_w_sidecar() with update = 'never' leaves an older revision's sidecar untouched", {
+  tmp_dir <- withr::local_tempdir()
+  out_path <- file.path(tmp_dir, "data.csv")
+  writeLines("current contents", out_path)
+  write_edi_sidecar(out_path, package_id = "edi.mock.1")
+
+  result <- run_sidecar(
+    out_path, update = "never", package_id = "edi.mock.2",
+    download_to_path = function(path) stop("download callback should not run")
+  )
+
+  expect_false(result$downloaded)
+  expect_equal(readRDS(paste0(out_path, ".edi.rds"))$package_id, "edi.mock.1")
+})
+
+test_that("download_w_sidecar() with update = 'if_changed' re-downloads stale files", {
+  tmp_dir <- withr::local_tempdir()
+
+  local_edi_checksum_mock()
+
+  # Scenario 1: the local file was modified after its sidecar was written
+  tampered <- file.path(tmp_dir, "tampered.csv")
+  writeLines("original", tampered)
+  write_edi_sidecar(tampered)
+  cat("extra bytes", file = tampered, append = TRUE)
+
+  result <- run_sidecar(
+    tampered, update = "if_changed",
+    download_to_path = function(path) writeLines("fresh", path)
+  )
+  expect_true(result$downloaded)
+  expect_equal(readLines(tampered), "fresh")
+
+  # Scenario 2: the sidecar is missing entirely
+  no_sidecar <- file.path(tmp_dir, "no_sidecar.csv")
+  writeLines("original", no_sidecar)
+
+  result <- run_sidecar(
+    no_sidecar, update = "if_changed",
+    download_to_path = function(path) writeLines("fresh", path)
+  )
+  expect_true(result$downloaded)
+
+  # Scenario 3: a newer package revision changed the remote entity. The sidecar
+  # records edi.mock.1, but edi.mock.2 reports a different checksum for the
+  # entity than the one the sidecar recorded.
+  remote_changed <- file.path(tmp_dir, "remote_changed.csv")
+  writeLines("original", remote_changed)
+  write_edi_sidecar(remote_changed, remote_checksum = different_checksum)
+
+  result <- run_sidecar(
+    remote_changed, update = "if_changed", package_id = "edi.mock.2",
+    download_to_path = function(path) writeLines("fresh", path)
+  )
+  expect_true(result$downloaded)
+})
+
+test_that("download_w_sidecar() leaves no partial file when the download is interrupted", {
+  tmp_dir <- withr::local_tempdir()
+  out_path <- file.path(tmp_dir, "data.csv")
+
+  local_edi_checksum_mock()
+
+  expect_error(
+    run_sidecar(
+      out_path, update = "always",
+      download_to_path = function(path) {
+        writeLines("partial download", path)
+        stop("connection reset by peer")
+      }
+    ),
+    regexp = "connection reset by peer"
+  )
+
+  # Neither the final file, temporary files, nor a sidecar remain
+  expect_false(file.exists(out_path))
+  expect_length(list.files(tmp_dir), 0)
+})
+
+test_that("download_w_sidecar() aborts when the download callback creates no file", {
+  tmp_dir <- withr::local_tempdir()
+  out_path <- file.path(tmp_dir, "data.csv")
+
+  local_edi_checksum_mock()
+
+  expect_error(
+    run_sidecar(out_path, update = "always", download_to_path = function(path) NULL),
+    regexp = "did not create a file"
+  )
+
+  expect_false(file.exists(out_path))
+  expect_length(list.files(tmp_dir), 0)
+})
+
+test_that("sidecar_is_current() returns FALSE for a sidecar that is not a list", {
+  tmp_dir <- withr::local_tempdir()
+  out_path <- file.path(tmp_dir, "data.csv")
+  writeLines("current contents", out_path)
+
+  # A valid RDS containing an atomic vector must not crash the currency check
+  saveRDS("not a metadata list", file = paste0(out_path, ".edi.rds"))
+
+  expect_false(sidecar_is_current(
+    download_filepath = out_path,
+    entity_key = "mock entity",
+    remote_checksum = fake_edi_checksum
+  ))
+})
+
+test_that("sidecar_is_current() skips the remote comparison when remote_checksum is NULL", {
+  tmp_dir <- withr::local_tempdir()
+  out_path <- file.path(tmp_dir, "data.csv")
+  writeLines("current contents", out_path)
+
+  # The recorded remote checksum matches nothing a caller would pass...
+  write_edi_sidecar(out_path, remote_checksum = different_checksum)
+
+  # ...but the remote comparison is skipped entirely when remote_checksum is
+  # NULL; only the local copy is verified
+  expect_true(sidecar_is_current(
+    download_filepath = out_path,
+    entity_key = "mock entity",
+    remote_checksum = NULL
+  ))
+
+  # A modified local file is still detected without a remote comparison
+  cat("tampered", file = out_path, append = TRUE)
+  expect_false(sidecar_is_current(
+    download_filepath = out_path,
+    entity_key = "mock entity",
+    remote_checksum = NULL
+  ))
+})
+
+test_that("sidecar_is_current() respects the sidecar suffix and checksum algorithm", {
+  tmp_dir <- withr::local_tempdir()
+  out_path <- file.path(tmp_dir, "riverSR_usa_v1.1.feather")
+  file.create(out_path)
+
+  # A Zenodo-style sidecar with an MD5 checksum
+  saveRDS(
+    list(
+      entity_key = "riverSR_usa_v1.1.feather",
+      remote_checksum = "0F343B0931126A20F133D67C2B018A3B",
+      local_checksum = generate_local_checksum(out_path, algo = "md5")
+    ),
+    file = paste0(out_path, ".zenodo.rds")
+  )
+
+  # Matches despite the case difference in the recorded checksum
+  expect_true(sidecar_is_current(
+    download_filepath = out_path,
+    entity_key = "riverSR_usa_v1.1.feather",
+    remote_checksum = "0f343b0931126a20f133d67c2b018a3b",
+    sidecar_suffix = ".zenodo.rds",
+    algo = "md5"
+  ))
+
+  # The default .edi.rds suffix does not find the .zenodo.rds sidecar
+  expect_false(sidecar_is_current(
+    download_filepath = out_path,
+    entity_key = "riverSR_usa_v1.1.feather",
+    remote_checksum = "0f343b0931126a20f133d67c2b018a3b",
+    algo = "md5"
+  ))
+
+  # A modified local file is detected
+  cat("tampered", file = out_path, append = TRUE)
+  expect_false(sidecar_is_current(
+    download_filepath = out_path,
+    entity_key = "riverSR_usa_v1.1.feather",
+    remote_checksum = "0f343b0931126a20f133d67c2b018a3b",
+    sidecar_suffix = ".zenodo.rds",
+    algo = "md5"
+  ))
+})
+
+test_that("alert_reused_file() reports the EDI version and download date", {
+  tmp_dir <- withr::local_tempdir()
+  out_path <- file.path(tmp_dir, "data.csv")
+  writeLines("current contents", out_path)
+  write_edi_sidecar(out_path, package_id = "edi.2254.1")
+
+  expect_message(
+    alert_reused_file(out_path),
+    regexp = "Using current local file.*edi\\.2254\\.1.*downloaded \\d{4}-\\d{2}-\\d{2}"
+  )
+})
+
+test_that("alert_reused_file() reports the Zenodo DOI for .zenodo.rds sidecars", {
+  tmp_dir <- withr::local_tempdir()
+  out_path <- file.path(tmp_dir, "riverSR_usa_v1.1.feather")
+  file.create(out_path)
+
+  saveRDS(
+    list(
+      entity_key = "riverSR_usa_v1.1.feather",
+      doi = "10.5281/zenodo.4304567",
+      remote_checksum = "0f343b0931126a20f133d67c2b018a3b",
+      local_checksum = generate_local_checksum(out_path, algo = "md5"),
+      checked_at = Sys.time()
+    ),
+    file = paste0(out_path, ".zenodo.rds")
+  )
+
+  expect_message(
+    alert_reused_file(out_path, sidecar_suffix = ".zenodo.rds"),
+    regexp = "Using current local file.*10\\.5281/zenodo\\.4304567.*downloaded \\d{4}-\\d{2}-\\d{2}"
+  )
+})
+
+test_that("alert_reused_file() falls back to the plain message without a usable sidecar", {
+  tmp_dir <- withr::local_tempdir()
+  out_path <- file.path(tmp_dir, "data.csv")
+  writeLines("current contents", out_path)
+
+  # No sidecar at all
+  msgs <- testthat::capture_messages(alert_reused_file(out_path))
+  expect_true(any(grepl("Using current local file", msgs)))
+  expect_false(any(grepl("downloaded", msgs)))
+
+  # A sidecar that is not a metadata list
+  saveRDS("not a metadata list", file = paste0(out_path, ".edi.rds"))
+  msgs <- testthat::capture_messages(alert_reused_file(out_path))
+  expect_true(any(grepl("Using current local file", msgs)))
+  expect_false(any(grepl("downloaded", msgs)))
+})
+
+test_that("pull_zenodo_files() returns lowercase MD5 checksums keyed by file name", {
+  # The nested lists stand in for the zen4R call chain in pull_zenodo_files():
+  # ZenodoManager$new() -> getRecordByDOI(doi) -> listFiles(pretty = TRUE)
+  testthat::local_mocked_bindings(
+    ZenodoManager = list(new = function() {
+      list(getRecordByDOI = function(doi) {
+        list(listFiles = function(pretty = TRUE) {
+          data.frame(
+            filename = c("riverSR_usa_v1.1.feather", "nhdplusv2_modified_v1.0.shp"),
+            filesize = c(138, 1),
+            checksum = c(
+              "md5:0F343B0931126A20F133D67C2B018A3B",
+              "md5:6067E1795B88E18B6F21F250B151E2AB"
+            ),
+            download = c("https://example.com/a", "https://example.com/b"),
+            stringsAsFactors = FALSE
+          )
+        })
+      })
+    }),
+    .package = "zen4R"
+  )
+
+  expect_equal(
+    pull_zenodo_files(doi = "10.5281/zenodo.4304567"),
+    c("riverSR_usa_v1.1.feather" = "0f343b0931126a20f133d67c2b018a3b",
+      "nhdplusv2_modified_v1.0.shp" = "6067e1795b88e18b6f21f250b151e2ab")
   )
 })

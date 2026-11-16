@@ -8,7 +8,7 @@ download_siteSR(
   download_folder,
   algal_mask = FALSE,
   version = "newest",
-  ask = TRUE
+  update = "ask"
 )
 }
 \arguments{
@@ -19,14 +19,28 @@ should be saved.}
 will be downloaded. Otherwise DSWE1 is used (i.e., FALSE).}
 
 \item{version}{Either "newest" or an integer corresponding to the data package
-version to use.}
+version to use. The lakeSR handoff coefficients are published only within the
+lakeSR data package, so they are taken from the lakeSR revision with the same
+number as the requested siteSR \code{version}. With "newest", the newest lakeSR
+release is used. If no lakeSR revision matches a numeric \code{version}, the newest
+lakeSR release is used and a warning is issued.}
 
-\item{ask}{Logical. Should the user be asked before downloading and overwriting
-siteSR files that already exist locally?}
+\item{update}{Character. How should updates to existing files be handled? Options are:
+\itemize{
+\item "ask": prompt before replacing an existing local file
+\item "always": download and replace it
+\item "never": reuse the local file whenever it exists
+\item "if_changed": reuse a local file if the selected remote version is unchanged
+and the local copy has not been modified; otherwise download it
+}
+
+Note that with "ask", the main siteSR Landsat files are handled with a single ask
+prompt for the entire group. The siteSR sites list and lakeSR handoff files each
+have their own user prompt.}
 }
 \value{
 A named character vector containing the local file paths for all
-downloaded siteSR datasets. Returned invisibly.
+requested files (either downloaded or reused). Returned invisibly.
 }
 \description{
 A function to facilitate downloading of the siteSR data product from
@@ -43,6 +57,22 @@ Downloads the following components of the \href{https://portal.edirepository.org
 \item siteSR data from Landsat 8 (.feather)
 \item siteSR data from Landsat 9 (.feather)
 }
+
+When a file is downloaded, a small metadata file (a "sidecar") is created
+containing information about the file. The "if_changed" option
+re-downloads siteSR files if the corresponding sidecar is
+missing, the remote file has changed, or the local copy has been modified.
+"never" keeps existing files as-is without checking their version. Matching
+filenames are not treated as evidence that the files themselves are up-to-date.
+When an existing file is reused under "if_changed" because it is unchanged
+in a newer EDI revision, its sidecar is updated to record that revision.
+Under "never", sidecars are not updated, so the version recorded is the
+version the file was downloaded under, which may be older than the newest
+version on EDI. To see which version you have for each downloaded file, run
+\code{\link[=check_sr_file_versions]{check_sr_file_versions()}} on the download folder.
+Note that in "if_changed" mode, the local file's checksum is recomputed on
+every call, which can take several seconds for the multi-gigabyte siteSR
+Feather files.
 }
 \note{
 The downloaded datasets will be large (several GB in size in total), so users
