@@ -123,13 +123,13 @@ vignette("example-workflow", package = "AquaMatchr")
 
 Please use the following citation when citing `AquaMatchr` in your work:
 
-> Brousil M, Ross M (2026). _AquaMatchr: Download, Join, and Analyze AquaMatch Data Products_. R package version 0.0.0.9001.
+> Brousil MR, Steele BG, Meyer MF, Ross MR (2026). _AquaMatchr: Download, Join, and Analyze AquaMatch Data Products_. R package version 0.0.0.9001.
 
 **BibTeX:**
 ```bibtex
  @Manual{,
     title = {AquaMatchr: Download, Join, and Analyze AquaMatch Data Products},
-    author = {Matthew Brousil and Matthew Ross},
+    author = {Matthew R. Brousil and Bethel G. Steele and Michael F. Meyer and Matthew R.V. Ross},
     year = {2026},
     note = {R package version 0.0.0.9001},
   }
