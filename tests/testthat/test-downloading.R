@@ -274,7 +274,7 @@ test_that("download_siteSR and download_lakeSR warn about mask errors in the cur
   expect_warning(
     download_siteSR(download_folder = tmp_dir, algal_mask = FALSE,
                     update = "never"),
-    regexp = "mask errors"
+    regexp = "masking errors"
   )
 
   # Second call deliberately replaces the first: it swaps in the lakeSR entity
@@ -295,7 +295,7 @@ test_that("download_siteSR and download_lakeSR warn about mask errors in the cur
   expect_warning(
     download_lakeSR(download_folder = tmp_dir, algal_mask = FALSE,
                     update = "never"),
-    regexp = "mask errors"
+    regexp = "masking errors"
   )
 })
 

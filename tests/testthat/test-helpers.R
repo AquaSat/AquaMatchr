@@ -186,11 +186,11 @@ test_that("infer_arrow_format() respects the `allowed` argument", {
 test_that("warn_broken_sr_release() warns only for the known-broken releases", {
   expect_warning(
     warn_broken_sr_release("edi.2114.1"),
-    regexp = "mask errors"
+    regexp = "masking errors"
   )
   expect_warning(
     warn_broken_sr_release("edi.2254.1"),
-    regexp = "mask errors"
+    regexp = "masking errors"
   )
 
   # Other revisions and unrelated packages are silent
