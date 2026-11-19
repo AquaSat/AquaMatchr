@@ -6,3 +6,5 @@
 ^\.positai$
 ^\.claude$
 ^\.github$
+^code\.json$
+^disclaimer\.md$

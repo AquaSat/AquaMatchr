@@ -207,13 +207,13 @@ check_update_arg <- function(update) {
   update
 }
 
-#' Warn about known mask errors in the current lakeSR/siteSR releases
+#' Warn about known masking errors in the current lakeSR/siteSR releases
 #'
 #' @param package_id EDI data package ID selected for download
 #'
 #' @return Invisible NULL, called for its warning side effect. Emits a warning
 #'   when `package_id` is one of the current releases (edi.2114.1, edi.2254.1),
-#'   whose Landsat 8/9 data products contain mask errors; does nothing for any
+#'   whose Landsat 8/9 data contain aerosol masking errors; does nothing for any
 #'   other revision. The scene metadata entities in these releases are
 #'   unaffected, so `download_sceneMetadata()` does not warn.
 #' @noRd
@@ -233,8 +233,9 @@ warn_broken_sr_release <- function(package_id) {
           " structure. Landsat 4, 5, and 7 data are not affected by this masking error."
         ),
         "i" = paste0(
-          "An updated release is forthcoming that will fix the masking error, provide data through October 
-          2026, and include additional diagnostic columns. This update is expected in early 2027."
+          "An updated release is forthcoming that will fix the masking error,",
+          " provide data through October 2026, and include additional diagnostic",
+          " columns. This update is expected in early 2027."
         )
       )
     )
@@ -412,7 +413,7 @@ download_w_sidecar <- function(download_filepath, update,
       # revision it now matches so the sidecar's version stays accurate
       if (!identical(metadata$package_id, package_id)) {
         saveRDS(
-          modifyList(metadata, list(package_id = package_id, entity_id = entity_id)),
+          utils::modifyList(metadata, list(package_id = package_id, entity_id = entity_id)),
           sidecar
         )
       }
